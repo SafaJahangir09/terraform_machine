@@ -1,0 +1,221 @@
+
+---
+- name: Wait for some time to ensure system readiness
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for port 22 
+      wait_for:
+        port: 22
+        host: "{{ ansible_host }}"
+        search_regex: OpenSSH
+        delay: 10
+        timeout: 60
+      delegate_to: localhost
+
+- name: Configure Docker
+  hosts: all
+  become: true
+  tasks:
+    - name: install docker and update cache
+      yum:
+        name: docker
+        state: present
+        update_cache: yes
+
+- name: Install Docker Compose
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: create docker cli-plugins directory
+      file:
+        path: /usr/local/lib/docker/cli-plugins
+        state: directory
+        mode: '0755'
+
+    - name: install docker-compose
+      get_url:
+        url: https://github.com/docker/compose/releases/latest/download/docker-compose-linux-{{ lookup('pipe', 'uname -m') }}
+        dest: /usr/local/lib/docker/cli-plugins/docker-compose
+        mode: +x
+
+    - name: View architecture of the system
+      debug:
+        msg: "System architecture of {{ inventory_hostname }} is {{ ansible_facts['architecture'] }}"
+
+    - name: Alternate method to view architecture of the system
+      debug:
+        msg: "System architecture of {{inventory_hostname}} is {{ lookup('pipe', 'uname -m') }}"
+
+    - name: restart docker service
+      service:
+        name: docker
+        state: restarted
+
+- name: Adding user to docker group
+  hosts: all
+  become: true
+  vars_files:
+    - project-vars.yaml
+  tasks:
+    - name: add user to docker group
+      user:
+        name: "{{ normal_user }}"
+        groups: docker
+        append: yes
+
+    - name: reconnect to apply group changes
+      meta: reset_connection
+
+    - name: verify docker access
+      command: docker ps
+      register: docker_ps
+      changed_when: false
+
+    - name: display docker ps output
+      debug:
+        var: docker_ps.stdout
+
+    - name: fail if docker is not accessible
+      fail:
+        msg: "Docker is not accessible on this host"
+      when: docker_ps.rc != 0
+
+- name: Deploy Docker Containers
+  hosts: all
+  become: true
+  user: "{{ normal_user }}"
+  vars_files:
+    - project-vars.yaml
+  tasks:
+    - name: check if docker-compose file exists
+      stat:
+        path: /home/{{ normal_user }}/compose.yaml
+      register: compose_file
+
+    - name: copy docker-compose file
+      copy:
+        src: "{{ docker_compose_file_location }}/compose.yaml"
+        dest: /home/{{ normal_user }}/compose.yaml
+        mode: '0644'
+      when: not compose_file.stat.exists
+
+    - name: deploy containers using docker-compose
+      command: docker compose up -d
+      register: compose_result
+      changed_when: "'Creating' in compose_result.stdout or 'Recreating' in compose_result.stdout"
+
+- name: Configure nginx web server
+  hosts: all
+  become: true
+  tasks:
+  - name: install nginx and update cache
+    yum:
+      name: nginx
+      state: present
+      update_cache: yes
+
+  - name: install openssl
+    yum:
+      name: openssl
+      state: present
+  
+  - name: start nginx server
+    service:
+      name: nginx
+      state: started
+      enabled: true
+  
+- name: Configure SSL certificates
+  hosts: all
+  become: true
+  tasks:
+  - name: Create SSL private directory
+    file:
+      path: /etc/ssl/private
+      state: directory
+      mode: '0700'
+
+  - name: Create SSL certs directory
+    file:
+      path: /etc/ssl/certs
+      state: directory
+      mode: '0755'
+
+  - name: Get IMDSv2 token
+    uri:
+      url: "http://169.254.169.254/latest/api/token"
+      method: PUT
+      headers:
+        X-aws-ec2-metadata-token-ttl-seconds: "3600"
+      return_content: yes
+    register: imdsv2_token
+
+  - name: Get current public IP
+    uri:
+      url: "http://169.254.169.254/latest/meta-data/public-ipv4"
+      headers:
+        X-aws-ec2-metadata-token: "{{ imdsv2_token.content }}"
+      return_content: yes
+    register: public_ip
+
+  - name: Show current public IP
+    debug:
+      msg: "Public IP: {{ public_ip.content }}"
+
+  - name: Save public IP as fact
+    set_fact:
+      server_public_ip: "{{ public_ip.content }}"
+
+  - name: Generate self-signed SSL certificate
+    command: >
+      openssl req -x509 -nodes -days 365
+      -newkey rsa:2048
+      -keyout /etc/ssl/private/selfsigned.key 
+      -out /etc/ssl/certs/selfsigned.crt 
+      -subj "/CN={{ public_ip.content }}" 
+      -addext "subjectAltName=IP:{{ public_ip.content }}" 
+      -addext "basicConstraints=CA:FALSE"
+      -addext "keyUsage=digitalSignature,keyEncipherment"
+      -addext "extendedKeyUsage=serverAuth"
+    args:
+      creates: /etc/ssl/certs/selfsigned.crt
+
+- name: Deploy Nginx website and configuration files
+  hosts: all
+  become: true
+  tasks:
+    - name: install php-fpm and php-curl
+      yum:
+        name:
+          - php-fpm
+          - php-curl
+        state: present
+
+    - name: Copy website files
+      copy:
+        src: files/index.php
+        dest: /usr/share/nginx/html/index.php
+        owner: nginx
+        group: nginx
+        mode: '0644'  
+
+    - name: Copy nginx.conf template
+      template:
+        src: templates/nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: restarted
+  
+    - name: Start and enable php-fpm
+      service:
+        name: php-fpm
+        state: started
+        enabled: true

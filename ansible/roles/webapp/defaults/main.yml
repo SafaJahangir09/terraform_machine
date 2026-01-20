@@ -1,0 +1,8 @@
+nginx_user: nginx
+nginx_worker_processes: auto
+nginx_worker_connections: 1024
+nginx_error_log_level: notice
+
+# Webapp settings
+web_root: /usr/share/nginx/html
+web_index_file: index.php
